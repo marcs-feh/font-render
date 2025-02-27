@@ -1,0 +1,11 @@
+font-render
+*.ttf
+*.o
+*.so
+*.a
+*.lib
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
