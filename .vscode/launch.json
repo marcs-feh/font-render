@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "preLaunchTask": "build",
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug",
+            "program": "${workspaceFolder}/font-render",
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
