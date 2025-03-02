@@ -24,13 +24,6 @@ Distance_Field :: struct {
 	offset: [2]int,
 }
 
-GlyphBitmap :: struct {
-	pixels: []u8,
-	width: int,
-	height: int,
-	offset: [2]int,
-}
-
 AtlasSlot :: struct {
 	width: int,
 	height: int,
@@ -42,7 +35,10 @@ AtlasSlot :: struct {
 @private
 AtlasUnpackedSlot :: struct {
 	atlas_offset: [2]int,
-	using bitmap: GlyphBitmap,
+	glyph_offset: [2]int,
+	pixels: []u8,
+	width: int,
+	height: int,
 }
 
 GlyphAtlas :: struct {
@@ -90,14 +86,14 @@ sigmoid_activate :: proc(v: f32, s: f32) -> f32 {
 	return 1.0 / (1 + math.exp(-s * (v - 0.5)))
 }
 
-get_rune_bitmap :: proc(font: ^Font, codepoint: rune, arena: ^mem.Arena) -> (bitmap: GlyphBitmap, err: mem.Allocator_Error){
+get_rune_bitmap :: proc(font: ^Font, codepoint: rune, arena: ^mem.Arena) -> (bitmap: AtlasUnpackedSlot, err: mem.Allocator_Error){
     context.allocator = mem.arena_allocator(arena)
 
 	sdf := get_rune_sdf(font, codepoint, arena) or_return
 	bitmap.pixels = make([]u8, sdf.width * sdf.height) or_return
 	bitmap.width = sdf.width
 	bitmap.height = sdf.height
-	bitmap.offset = sdf.offset
+	bitmap.glyph_offset = sdf.offset
 
 	for sv, i in sdf.values {
 		v := f32(sv) / 0xff
@@ -176,15 +172,13 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 
     total_width := 0
 
+	// Render and pack slots
 	for &slot, i in packing_slots {
-		bmap, err := get_rune_bitmap(font, base + rune(i), &arena)
+		err : mem.Allocator_Error
+		slot, err = get_rune_bitmap(font, base + rune(i), &arena)
         if err != nil { continue }
 
-        total_width += bmap.width
-
-		slot.offset = bmap.offset
-		slot.width = bmap.width
-		slot.height = bmap.height
+        total_width += slot.width
 	}
 	fmt.println("Peak:", arena.peak_used / mem.Kilobyte, "KiB")
 
@@ -201,48 +195,54 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 		slot.width = packed_slot.width
 		slot.height = packed_slot.height
 		slot.atlas_offset = packed_slot.atlas_offset
-		slot.glyph_offset = packed_slot.offset
+		slot.glyph_offset = packed_slot.glyph_offset
+
+		for y in 0..<slot.height {
+			for x in 0..<slot.width {
+				ax, ay := x + packed_slot.atlas_offset.x, y + packed_slot.atlas_offset.y
+				atlas.pixels[atlas.width * ay + ax] = packed_slot.pixels[packed_slot.width * y + x]
+			}
+		}
 	}
 
 	return
 }
 
-import "core:hash"
-draw_atlas :: proc(atlas: GlyphAtlas){
-	rl.DrawRectangleLines(0, 0, i32(atlas.width), i32(atlas.height), rl.RED)
+draw_atlas :: proc(atlas: GlyphAtlas, pos: [2]int){
+	rl.DrawRectangleLines(i32(pos.x), i32(pos.y), i32(atlas.width), i32(atlas.height), rl.RED)
 
 	for glyph in atlas.slots {
 		off := glyph.atlas_offset
-		bytes := transmute([size_of(off)]byte)off
 
-		r := u8(hash.fnv32(bytes[:]) % 120) + 100
-		rl.DrawRectangle(i32(glyph.atlas_offset.x), i32(glyph.atlas_offset.y), i32(glyph.width), i32(glyph.height),
-			{r, 0xfe, 0xfe, 127})
+		rl.DrawRectangleLines(i32(glyph.atlas_offset.x + pos.x), i32(glyph.atlas_offset.y + pos.y), i32(glyph.width), i32(glyph.height),
+			{0x30, 0xfe, 0xfe, 0xff})
 	}
 }
 
-as_texture :: proc(bmap: GlyphBitmap) -> rl.Texture {
+as_texture :: proc(atlas: GlyphAtlas) -> rl.Texture {
 	img := rl.Image {
-		data = raw_data(bmap.pixels),
-		width = i32(bmap.width),
-		height = i32(bmap.height),
+		data = raw_data(atlas.pixels),
+		width = i32(atlas.width),
+		height = i32(atlas.height),
 		mipmaps = 1,
-		format = .UNCOMPRESSED_GRAY_ALPHA,
+		format = .UNCOMPRESSED_GRAYSCALE,
 	}
 
 	return rl.LoadTextureFromImage(img)
 }
+
+// TODO: de-duplicate reduntant "glyph not found char" with ttf.GetGlyphIndex
 
 main :: proc(){
 	rl.InitWindow(1200, 800, "font render")
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
-	font, ok := font_load(FONT, 36)
+	font, ok := font_load(FONT, 24)
 	ensure(ok, "Failed to laod font")
 
     now := time.now()
-	atlas, _ := atlas_create(&font, 512, 256)
+	atlas, _ := atlas_create(&font, 0x2200, 1024)
     elapsed := time.since(now)
 
     fmt.println("Took", elapsed, "to create atlas")
@@ -250,12 +250,12 @@ main :: proc(){
 	//     get_rune_bitmap(&font, rune(r))
 	// }
 
-	// tex := as_texture(font.bitmap_cache['G'])
+	tex := as_texture(atlas)
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
-		// rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xff, 0xff, 0xff, 0xff})
-		draw_atlas(atlas)
+		rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xff, 0xff, 0xff, 0xff})
+		draw_atlas(atlas, {10, 10})
 		rl.EndDrawing()
 	}
 }
