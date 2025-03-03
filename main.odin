@@ -124,7 +124,7 @@ font_load :: proc(data: []byte, size: f32) -> (font: Font, ok: bool) {
 font_destroy :: proc(font: ^Font){
 }
 
-FONT :: #load("noto.ttf", []byte)
+FONT :: #load("jetbrains.ttf", []byte)
 
 @(require_results, private)
 pack_atlas_rows :: proc(glyphs: []RawGlyph, max_width: int) -> (int, int){
@@ -287,7 +287,7 @@ main :: proc(){
 
     now := time.now()
 	// atlas, _ := atlas_create(&font, 0x4e00, 0x9fff - 0x4e00)
-	atlas, _ := atlas_create(&font, 0, 8192)
+	atlas, _ := atlas_create(&font, 0, 0x2200 + 1024)
 
 	// atlas, _ := atlas_create(&font, 0x2200, 1024)
     elapsed := time.since(now)
