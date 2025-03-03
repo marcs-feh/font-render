@@ -2,9 +2,12 @@ package font_render
 
 import "core:slice"
 import "core:mem"
+import "core:container/lru"
 import "core:fmt"
 import "core:time"
 import "core:math"
+import "set"
+
 import rl "vendor:raylib"
 import ttf "vendor:stb/truetype"
 
@@ -14,6 +17,7 @@ import ttf "vendor:stb/truetype"
 Font :: struct {
 	info: ttf.fontinfo,
 	sdf_cache: map[rune]Distance_Field,
+	placeholder: Distance_Field,
 	allocator: mem.Allocator,
 
 	size: f32,
@@ -60,24 +64,25 @@ GlyphAtlas :: struct {
 
 PLACEHOLDER_RUNE :: -1
 
-// Get rune signed distance field from font, if the rune is not supported by
-// font `has_glyph` will be false and the placeholder SDF will be returned.
-get_rune_sdf :: proc(font: ^Font, codepoint: rune) -> (field: Distance_Field, has_glyph: bool, err: mem.Allocator_Error) {
-	has_glyph = ttf.FindGlyphIndex(&font.info, codepoint) > 0
-
+get_rune_sdf :: proc(font: ^Font, codepoint: rune) -> (field: Distance_Field, err: mem.Allocator_Error) {
 	// Cache hit
 	if sdf, cached := font.sdf_cache[codepoint]; cached {
-		return sdf, has_glyph, nil
+		return sdf, nil
 	}
 
-	// Replace unsupported codepoints with the placeholder to avoid a bunch of redundant copies to the same "Not found" character
-	if codepoint != PLACEHOLDER_RUNE && !has_glyph {
-		field, _ = get_rune_sdf(font, PLACEHOLDER_RUNE) or_return
-		field.codepoint = codepoint
-		font.sdf_cache[codepoint] = field
+	has_glyph := ttf.FindGlyphIndex(&font.info, codepoint) != 0
+	if !has_glyph {
+		field = font.placeholder
 		return
 	}
 
+	field = render_sdf(font, codepoint) or_return
+
+	return
+}
+
+render_sdf :: proc(font: ^Font, codepoint: rune, allocator := context.allocator) -> (field: Distance_Field, err: mem.Allocator_Error) {
+	context.allocator = allocator
 	on_edge    := u8(font.edge_value * 0xff)
 	dist_scale := font.dist_scale * 0xff
 
@@ -109,10 +114,8 @@ sigmoid_activate :: proc(v: f32, s: f32) -> f32 {
 	return 1.0 / (1 + math.exp(-s * (v - 0.5)))
 }
 
-// Push a temporary render of a distance field to arena
-render_temp_bitmap :: proc(sdf: Distance_Field, sharpness: f32, arena: ^mem.Arena) -> (glyph: RawGlyph, err: mem.Allocator_Error){
-    context.allocator = mem.arena_allocator(arena)
-
+render_temp_bitmap :: proc(sdf: Distance_Field, sharpness: f32, allocator := context.allocator) -> (glyph: RawGlyph, err: mem.Allocator_Error){
+	context.allocator = allocator
 	glyph.pixels = make([]u8, sdf.width * sdf.height) or_return
 	glyph.width  = sdf.width
 	glyph.height = sdf.height
@@ -128,17 +131,35 @@ render_temp_bitmap :: proc(sdf: Distance_Field, sharpness: f32, arena: ^mem.Aren
 	return
 }
 
+DEFAULT_CACHE_CAPACITY :: 256
+
 font_load :: proc(data: []byte, size: f32, allocator := context.allocator) -> (font: Font, ok: bool) {
 	mem_err : mem.Allocator_Error
 	bool(ttf.InitFont(&font.info, raw_data(data), 0)) or_return
 
+	ok = true
 	font.size = size
 	font.edge_value = 0.63
 	font.dist_scale = 0.61
 	font.sharpness = 9.25
 	font.allocator = allocator
 
-	ok = true
+	context.allocator = allocator
+	defer if !ok {
+		delete(font.sdf_cache)
+		delete(font.placeholder.values)
+	}
+
+	font.sdf_cache, mem_err = make(map[rune]Distance_Field, DEFAULT_CACHE_CAPACITY)
+	if mem_err != nil {
+		ok = false
+	}
+	
+	font.placeholder, mem_err = render_sdf(&font, -1, font.allocator)
+	if mem_err != nil {
+		ok = false
+	}
+
 	return
 }
 
@@ -159,7 +180,7 @@ font_destroy :: proc(font: ^Font){
 
 	// NOTE: Because all placeholder runes share the same values, they are
 	//       ignored and the deletion is deferred for later
-	placeholder_values := font.sdf_cache[PLACEHOLDER_RUNE].values
+	placeholder_values := font.placeholder.values
 	defer delete(placeholder_values)
 
 	for codepoint, sdf in font.sdf_cache {
@@ -320,6 +341,18 @@ as_texture :: proc(atlas: GlyphAtlas) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
+sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
+	img := rl.Image{
+		data = raw_data(f.values),
+		width = f.width,
+		height = f.height,
+		mipmaps = 1,
+		format = .UNCOMPRESSED_GRAYSCALE,
+	}
+
+	return rl.LoadTextureFromImage(img)
+}
+
 FONT :: #load("jetbrains.ttf", []byte)
 
 main :: proc(){
@@ -327,16 +360,18 @@ main :: proc(){
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
-	font, ok := font_load(FONT, 24)
+	font, ok := font_load(FONT, 64)
 	font.edge_value = 0.52
 	font.sharpness = 12.1
 	ensure(ok, "Failed to laod font")
+
+	sdftex := sdf_texture(font.placeholder)
 
 	// tex := as_texture(atlas)
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
-		// rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xff, 0xff, 0xff, 0xff})
+		rl.DrawTextureEx(sdftex, {10, 10}, 0, 1, {0xff, 0xff, 0xff, 0xff})
 		// draw_atlas_grid(atlas, {10, 10})
 		rl.EndDrawing()
 	}
