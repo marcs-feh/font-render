@@ -58,10 +58,11 @@ GlyphAtlas :: struct {
 	height: int,
 }
 
+PLACEHOLDER_RUNE :: -1
+
 // Get rune signed distance field from font, if the rune is not supported by
 // font `has_glyph` will be false and the placeholder SDF will be returned.
 get_rune_sdf :: proc(font: ^Font, codepoint: rune) -> (field: Distance_Field, has_glyph: bool, err: mem.Allocator_Error) {
-	PLACEHOLDER_RUNE :: -1
 	has_glyph = ttf.FindGlyphIndex(&font.info, codepoint) > 0
 
 	// Cache hit
@@ -156,7 +157,15 @@ font_pack_atlas :: proc(font: ^Font, arena: ^mem.Arena) -> (atlas: GlyphAtlas, e
 font_destroy :: proc(font: ^Font){
 	context.allocator = font.allocator
 
+	// NOTE: Because all placeholder runes share the same values, they are
+	//       ignored and the deletion is deferred for later
+	placeholder_values := font.sdf_cache[PLACEHOLDER_RUNE].values
+	defer delete(placeholder_values)
+
 	for codepoint, sdf in font.sdf_cache {
+		if raw_data(sdf.values) == raw_data(placeholder_values) {
+			continue
+		}
 		delete(sdf.values)
 	}
 	delete(font.sdf_cache)
