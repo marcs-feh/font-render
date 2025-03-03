@@ -124,7 +124,7 @@ font_load :: proc(data: []byte, size: f32) -> (font: Font, ok: bool) {
 font_destroy :: proc(font: ^Font){
 }
 
-FONT :: #load("jetbrains.ttf", []byte)
+FONT :: #load("noto.ttf", []byte)
 
 @(require_results, private)
 pack_atlas_rows :: proc(glyphs: []RawGlyph, max_width: int) -> (int, int){
@@ -173,7 +173,7 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 	raw_glyphs := make([dynamic]RawGlyph, 0, glyph_count + 1, context.temp_allocator) or_return
 
     total_width : int
-			
+	non_zero_slots : int = 1
 	// Add placeholder rune
 	{
 		placeholder_slot := get_rune_bitmap(font, 0, &arena) or_return
@@ -182,6 +182,7 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 		total_width += placeholder_slot.width
 	}
 
+	start := time.now()
 	// Render slots bitmaps
 	for off in 0..<rune(glyph_count) {
 		slot : RawGlyph
@@ -191,12 +192,12 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 		if idx := ttf.FindGlyphIndex(&font.info, r); idx != 0 {
 			slot, err = get_rune_bitmap(font, base + off, &arena)
 			if err != nil { continue }
+			total_width += int(slot.width)
+			non_zero_slots += 1
 		}
 		append(&raw_glyphs, slot)
-		total_width += int(slot.width)
 	}
-
-	fmt.println("Rendering Peak:", arena.peak_used / mem.Kilobyte, "KiB")
+	fmt.println("Rendering Peak:", arena.peak_used / mem.Kilobyte, "KiB", "Took:", time.since(start))
 
 	assert(len(raw_glyphs) == glyph_count + 1, "Did not create all glyphs, maybe reserved space is too small?")
 
@@ -206,8 +207,8 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 		atlas.base_glyph = base
 		atlas.font = font
 
-		atlas_width := int(f64(total_width / len(atlas.slots)) * math.sqrt(f64(glyph_count)) * 1.5)
-		aw, ah := pack_atlas_rows(raw_glyphs[:], max(16, atlas_width))
+		atlas_width := f64(total_width / non_zero_slots) * math.sqrt(f64(non_zero_slots)) * 1.5
+		aw, ah := pack_atlas_rows(raw_glyphs[:], int(max(16, atlas_width)))
 
 		atlas.pixels = make([]u8, aw * ah) or_return
 		atlas.width = aw
@@ -216,11 +217,13 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 
 	// Transfer temporary packed slots into final atlas bitmap
 	placeholder := raw_glyphs[0]
+	bad_chars := 0
+	defer fmt.println("Bad characters:", bad_chars)
 	for &slot, i in atlas.slots {
 		packed_slot := raw_glyphs[i]
 
 		if packed_slot.width == 0 && packed_slot.height == 0 {
-			fmt.println("CU SLOT", packed_slot.codepoint)
+			bad_chars += 1
 			atlas.slots[i] = AtlasSlot {
 				glyph_offset = placeholder.glyph_offset,
 				atlas_offset = placeholder.atlas_offset,
@@ -249,7 +252,7 @@ atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 
 	return
 }
 
-draw_atlas :: proc(atlas: GlyphAtlas, pos: [2]int){
+draw_atlas_grid :: proc(atlas: GlyphAtlas, pos: [2]int){
 	rl.DrawRectangleLines(i32(pos.x), i32(pos.y), i32(atlas.width), i32(atlas.height), rl.RED)
 
 	for glyph in atlas.slots {
@@ -272,18 +275,20 @@ as_texture :: proc(atlas: GlyphAtlas) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
-// TODO: de-duplicate reduntant "glyph not found char" with ttf.GetGlyphIndex
-
 main :: proc(){
 	rl.InitWindow(1200, 800, "font render")
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
 	font, ok := font_load(FONT, 24)
+	font.edge_value = 0.52
+	font.sharpness = 12.1
 	ensure(ok, "Failed to laod font")
 
     now := time.now()
-	atlas, _ := atlas_create(&font, 0, 60)
+	// atlas, _ := atlas_create(&font, 0x4e00, 0x9fff - 0x4e00)
+	atlas, _ := atlas_create(&font, 0, 8192)
+
 	// atlas, _ := atlas_create(&font, 0x2200, 1024)
     elapsed := time.since(now)
 
@@ -292,15 +297,15 @@ main :: proc(){
 	//     get_rune_bitmap(&font, rune(r))
 	// }
 
-	for slot, i in atlas.slots {
-		fmt.println(slot.codepoint, ":", slot.atlas_offset, slot.width, slot.height)
-	}
+	// for slot, i in atlas.slots {
+	// 	fmt.println(slot.codepoint, ":", slot.atlas_offset, slot.width, slot.height)
+	// }
 	tex := as_texture(atlas)
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
 		rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xff, 0xff, 0xff, 0xff})
-		draw_atlas(atlas, {10, 10})
+		draw_atlas_grid(atlas, {10, 10})
 		rl.EndDrawing()
 	}
 }
