@@ -236,7 +236,7 @@ RECOMMENDED_ATLAS_TEMP_SIZE :: 128 * mem.Kilobyte
 font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena, allocator := context.allocator) -> (atlas: Glyph_Atlas, err: mem.Allocator_Error){
 	arena_restore := mem.begin_arena_temp_memory(temp_arena)
 	defer mem.end_arena_temp_memory(arena_restore)
-	// defer fmt.println("Peak usage:", temp_arena.peak_used / mem.Kilobyte, "KiB")
+	defer fmt.println("Peak usage:", temp_arena.peak_used / mem.Kilobyte, "KiB")
 
 	mem_remaining := len(temp_arena.data) - temp_arena.offset
 	when ODIN_DEBUG {
@@ -269,7 +269,7 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena, allocator := co
 	placeholder_bmap := render_bitmap(font.placeholder, font.sharpness, context.temp_allocator) or_return
 	append(&packed_bitmaps, placeholder_bmap)
 
-	desired_atlas_width := 1.5 * math.sqrt(f64(len(packed_bitmaps))) * f64(total_sdf_width) / f64(total_sdf_count)
+	desired_atlas_width := 1.5*math.sqrt(f64(len(packed_bitmaps))) * f64(total_sdf_width) / f64(total_sdf_count)
 
 	aw, ah := pack_atlas_rows(packed_bitmaps[:], i32(desired_atlas_width))
 
@@ -328,6 +328,22 @@ as_texture :: proc(atlas: Glyph_Atlas) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
+font_sdf_memory_usage :: proc(font: Font) -> int {
+	total := 0
+	for codepoint, sdf in font.sdf_cache {
+		total += slice.size(sdf.values) + size_of(Distance_Field)
+	}
+	return total
+}
+
+atlas_memory_usage :: proc(atlas: Glyph_Atlas) -> int {
+	total := int(atlas.width * atlas.height)
+	for codepoint, slot in atlas.glyphs {
+		total += size_of(Glyph_Atlas_Slot)
+	}
+	return total
+}
+
 sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
 	img := rl.Image{
 		data = raw_data(f.values),
@@ -340,32 +356,31 @@ sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
-FONT :: #load("jetbrains.ttf", []byte)
+FONT :: #load("noto.ttf", []byte)
 
 main :: proc(){
 	rl.InitWindow(1200, 800, "font render")
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
-	font, ok := font_load(FONT, 128)
+	font, ok := font_load(FONT, 64)
 	defer font_destroy(&font)
 	font.edge_value = 0.52
-	font.sharpness = 12.1
+	// font.dist_scale = 1.2
+	// font.sharpness = 7.0
+	// font.sharpness = 12.1
 	ensure(ok, "Failed to laod font")
 
 	{
 		beg := time.now()
-		for r in 0..<max(u16) {
-			get_rune_sdf(&font, rune(r))
-		}
+		/* Latin1   */ for r in 0x0000..<0x00ff { get_rune_sdf(&font, rune(r)) }
+		/* Latin+   */ for r in 0x0180..<0x02af { get_rune_sdf(&font, rune(r)) }
+		/* Greek    */ for r in 0x0370..<0x03ff { get_rune_sdf(&font, rune(r)) }
+		/* Cyrillic */ for r in 0x0400..<0x04ff { get_rune_sdf(&font, rune(r)) }
+		/* Armenian */ for r in 0x0530..<0x058f { get_rune_sdf(&font, rune(r)) }
+		/* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(&font, rune(r)) }
+		/* Math+    */ for r in 0x2a00..<0x2aff { get_rune_sdf(&font, rune(r)) }
 		fmt.println("Fresh SDF:", time.since(beg))
-	}
-	{
-		beg := time.now()
-		for r in 0..<max(u16) {
-			get_rune_sdf(&font, rune(r))
-		}
-		fmt.println("Cached SDF:", time.since(beg))
 	}
 
 	atlas_arena : mem.Arena
@@ -374,10 +389,16 @@ main :: proc(){
 		mem.arena_init(&atlas_arena, atlas_arena_mem[:])
 	}
 
+	beg := time.now()
 	atlas, _ := font_generate_atlas(&font, &atlas_arena)
+	fmt.println("Atlas generation:", time.since(beg))
 	defer atlas_destroy(&atlas)
-	
+
 	tex := as_texture(atlas)
+	fmt.println("Glyphs loaded:", len(atlas.glyphs))
+	fmt.println("Glyphs cap:", cap(font.sdf_cache))
+	fmt.println("SDF Mem usage:", font_sdf_memory_usage(font) / mem.Kilobyte, "KiB")
+	fmt.println("Atlas Mem usage:", atlas_memory_usage(atlas) / mem.Kilobyte, "KiB")
 
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
