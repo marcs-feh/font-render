@@ -2,7 +2,6 @@ package font_render
 
 import "core:slice"
 import "core:mem"
-import "core:container/lru"
 import "core:fmt"
 import "core:time"
 import "core:math"
@@ -181,7 +180,7 @@ font_destroy :: proc(font: ^Font){
 	placeholder_values := font.placeholder.values
 	defer delete(placeholder_values)
 
-	for codepoint, sdf in font.sdf_cache {
+	for _, sdf in font.sdf_cache {
 		if raw_data(sdf.values) == raw_data(placeholder_values) {
 			continue
 		}
@@ -238,8 +237,8 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena, allocator := co
 	defer mem.end_arena_temp_memory(arena_restore)
 	defer fmt.println("Peak usage:", temp_arena.peak_used / mem.Kilobyte, "KiB")
 
-	mem_remaining := len(temp_arena.data) - temp_arena.offset
 	when ODIN_DEBUG {
+		mem_remaining := len(temp_arena.data) - temp_arena.offset
 		ensure(mem_remaining >= RECOMMENDED_ATLAS_TEMP_SIZE, "Arena is smaller than the recommended size to generate a font atlas")
 	}
 	context.temp_allocator = mem.arena_allocator(temp_arena)
@@ -309,8 +308,6 @@ draw_atlas_grid :: proc(atlas: Glyph_Atlas, pos: [2]i32){
 	rl.DrawRectangleLines(i32(pos.x), i32(pos.y), i32(atlas.width), i32(atlas.height), rl.RED)
 
 	for _, glyph in atlas.glyphs {
-		off := glyph.atlas_offset
-
 		rl.DrawRectangleLines(i32(glyph.atlas_offset.x + pos.x), i32(glyph.atlas_offset.y + pos.y), i32(glyph.width), i32(glyph.height),
 			{0x30, 0xfe, 0xfe, 0xff})
 	}
@@ -330,7 +327,7 @@ as_texture :: proc(atlas: Glyph_Atlas) -> rl.Texture {
 
 font_sdf_memory_usage :: proc(font: Font) -> int {
 	total := 0
-	for codepoint, sdf in font.sdf_cache {
+	for _, sdf in font.sdf_cache {
 		total += slice.size(sdf.values) + size_of(Distance_Field)
 	}
 	return total
@@ -338,7 +335,7 @@ font_sdf_memory_usage :: proc(font: Font) -> int {
 
 atlas_memory_usage :: proc(atlas: Glyph_Atlas) -> int {
 	total := int(atlas.width * atlas.height)
-	for codepoint, slot in atlas.glyphs {
+	for _ in atlas.glyphs {
 		total += size_of(Glyph_Atlas_Slot)
 	}
 	return total
