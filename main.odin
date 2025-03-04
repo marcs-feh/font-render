@@ -353,7 +353,7 @@ sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
-FONT :: #load("noto.ttf", []byte)
+FONT :: #load("jetbrains.ttf", []byte)
 
 main :: proc(){
 	rl.InitWindow(1200, 800, "font render")
