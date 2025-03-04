@@ -2,9 +2,11 @@ package font_render
 
 import "core:slice"
 import "core:mem"
+import "core:container/lru"
 import "core:fmt"
 import "core:time"
 import "core:math"
+
 import rl "vendor:raylib"
 import ttf "vendor:stb/truetype"
 
@@ -14,6 +16,7 @@ import ttf "vendor:stb/truetype"
 Font :: struct {
 	info: ttf.fontinfo,
 	sdf_cache: map[rune]Distance_Field,
+	placeholder: Distance_Field,
 	allocator: mem.Allocator,
 
 	size: f32,
@@ -30,16 +33,15 @@ Distance_Field :: struct {
 	codepoint: rune,
 }
 
-AtlasSlot :: struct {
-	width: int,
-	height: int,
-	atlas_offset: [2]int,
-	glyph_offset: [2]int,
+Glyph_Atlas_Slot :: struct {
+	width: i32,
+	height: i32,
+	atlas_offset: [2]i32,
+	glyph_offset: [2]i32,
 }
 
-// Used only to pack glyphs
-@private
-RawGlyph :: struct {
+// Rendered version of a glyph, note that `atlas_offset` is only used to pack the glyph
+Glyph_Bitmap :: struct {
 	codepoint: rune,
 	atlas_offset: [2]i32,
 	glyph_offset: [2]i32,
@@ -48,36 +50,37 @@ RawGlyph :: struct {
 	pixels: []u8,
 }
 
-GlyphAtlas :: struct {
-	base_glyph: rune,
-	glyphs: map[rune]AtlasSlot,
-	font: ^Font,
-
+Glyph_Atlas :: struct {
+	glyphs: map[rune]Glyph_Atlas_Slot,
 	pixels: []u8,
-	width: int,
-	height: int,
+	width: i32,
+	height: i32,
 }
 
 PLACEHOLDER_RUNE :: -1
 
-// Get rune signed distance field from font, if the rune is not supported by
-// font `has_glyph` will be false and the placeholder SDF will be returned.
-get_rune_sdf :: proc(font: ^Font, codepoint: rune) -> (field: Distance_Field, has_glyph: bool, err: mem.Allocator_Error) {
-	has_glyph = ttf.FindGlyphIndex(&font.info, codepoint) > 0
-
+get_rune_sdf :: proc(font: ^Font, codepoint: rune) -> (field: Distance_Field, err: mem.Allocator_Error) {
+	context.allocator = font.allocator
 	// Cache hit
 	if sdf, cached := font.sdf_cache[codepoint]; cached {
-		return sdf, has_glyph, nil
+		return sdf, nil
 	}
 
-	// Replace unsupported codepoints with the placeholder to avoid a bunch of redundant copies to the same "Not found" character
-	if codepoint != PLACEHOLDER_RUNE && !has_glyph {
-		field, _ = get_rune_sdf(font, PLACEHOLDER_RUNE) or_return
-		field.codepoint = codepoint
-		font.sdf_cache[codepoint] = field
+	has_glyph := ttf.FindGlyphIndex(&font.info, codepoint) != 0
+	if !has_glyph {
+		field = font.placeholder
 		return
 	}
 
+	field = render_sdf(font, codepoint) or_return
+	font.sdf_cache[codepoint] = field
+
+	return
+}
+
+@(require_results)
+render_sdf :: proc(font: ^Font, codepoint: rune, allocator := context.allocator) -> (field: Distance_Field, err: mem.Allocator_Error) {
+	context.allocator = allocator
 	on_edge    := u8(font.edge_value * 0xff)
 	dist_scale := font.dist_scale * 0xff
 
@@ -109,10 +112,9 @@ sigmoid_activate :: proc(v: f32, s: f32) -> f32 {
 	return 1.0 / (1 + math.exp(-s * (v - 0.5)))
 }
 
-// Push a temporary render of a distance field to arena
-render_temp_bitmap :: proc(sdf: Distance_Field, sharpness: f32, arena: ^mem.Arena) -> (glyph: RawGlyph, err: mem.Allocator_Error){
-    context.allocator = mem.arena_allocator(arena)
-
+@(require_results)
+render_bitmap_sdf :: proc(sdf: Distance_Field, sharpness: f32, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
+	context.allocator = allocator
 	glyph.pixels = make([]u8, sdf.width * sdf.height) or_return
 	glyph.width  = sdf.width
 	glyph.height = sdf.height
@@ -128,28 +130,45 @@ render_temp_bitmap :: proc(sdf: Distance_Field, sharpness: f32, arena: ^mem.Aren
 	return
 }
 
+render_bitmap_rune :: proc(font: ^Font, codepoint: rune, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
+	context.allocator = allocator
+	sdf := get_rune_sdf(font, codepoint) or_return
+	return render_bitmap_sdf(sdf, font.sharpness)
+}
+
+render_bitmap :: proc {
+	render_bitmap_sdf,
+	render_bitmap_rune,
+}
+
+DEFAULT_CACHE_CAPACITY :: 256
+
 font_load :: proc(data: []byte, size: f32, allocator := context.allocator) -> (font: Font, ok: bool) {
 	mem_err : mem.Allocator_Error
 	bool(ttf.InitFont(&font.info, raw_data(data), 0)) or_return
 
+	ok = true
 	font.size = size
 	font.edge_value = 0.63
 	font.dist_scale = 0.61
 	font.sharpness = 9.25
 	font.allocator = allocator
 
-	ok = true
-	return
-}
+	context.allocator = allocator
+	defer if !ok {
+		delete(font.sdf_cache)
+		delete(font.placeholder.values)
+	}
 
-font_pack_atlas :: proc(font: ^Font, arena: ^mem.Arena) -> (atlas: GlyphAtlas, err: mem.Allocator_Error){
-	arena_restore := mem.begin_arena_temp_memory(arena)
-	defer mem.end_arena_temp_memory(arena_restore)
-	context.temp_allocator = mem.arena_allocator(arena)
-
-	glyphs := make([dynamic]RawGlyph, 0, len(font.sdf_cache) + 1, context.temp_allocator) or_return
-	total_width : i32
-	valid_slots : i32
+	font.sdf_cache, mem_err = make(map[rune]Distance_Field, DEFAULT_CACHE_CAPACITY)
+	if mem_err != nil {
+		ok = false
+	}
+	
+	font.placeholder, mem_err = render_sdf(&font, -1, font.allocator)
+	if mem_err != nil {
+		ok = false
+	}
 
 	return
 }
@@ -159,7 +178,7 @@ font_destroy :: proc(font: ^Font){
 
 	// NOTE: Because all placeholder runes share the same values, they are
 	//       ignored and the deletion is deferred for later
-	placeholder_values := font.sdf_cache[PLACEHOLDER_RUNE].values
+	placeholder_values := font.placeholder.values
 	defer delete(placeholder_values)
 
 	for codepoint, sdf in font.sdf_cache {
@@ -171,17 +190,12 @@ font_destroy :: proc(font: ^Font){
 	delete(font.sdf_cache)
 }
 
-atlas_create :: proc(font: ^Font) -> (atlas: GlyphAtlas, err: mem.Allocator_Error) {
-	atlas.glyphs = make(map[rune]AtlasSlot, 256) or_return
-	atlas.font = font
-	return
-}
 
 @(require_results, private)
-pack_atlas_rows :: proc(glyphs: []RawGlyph, max_width: i32) -> (int, int){
+pack_atlas_rows :: proc(glyphs: []Glyph_Bitmap, max_width: i32) -> (i32, i32){
 	cur_x, cur_y, max_height, total_height : i32
 
-	slice.sort_by_cmp(glyphs[:], proc(a, b: RawGlyph) -> slice.Ordering {
+	slice.sort_by_cmp(glyphs[:], proc(a, b: Glyph_Bitmap) -> slice.Ordering {
 		ord := slice.Ordering(clamp(-1, b.height - a.height, +1))
 		if ord == .Equal {
 			ord = slice.Ordering(clamp(-1, b.width - a.width, +1))
@@ -204,111 +218,105 @@ pack_atlas_rows :: proc(glyphs: []RawGlyph, max_width: i32) -> (int, int){
 
 	total_height += max_height
 
-	return int(max_width + 2), int(total_height + 2)
+	return max_width + 2, total_height + 2
 }
 
-// atlas_create :: proc(font: ^Font, base: rune, glyph_count: int, temp_reserve := 32 * mem.Megabyte) -> (atlas: GlyphAtlas, err: mem.Allocator_Error){
-// 	// Setup arena for temporary bitmap allocations
-//     arena_mem := make([]byte, temp_reserve) or_return
-// 	defer delete(arena_mem)
-//     arena : mem.Arena
-//     mem.arena_init(&arena, arena_mem)
-// 	context.temp_allocator = mem.arena_allocator(&arena)
-//
-// 	raw_glyphs := make([dynamic]RawGlyph, 0, glyph_count + 1, context.temp_allocator) or_return
-//
-//     total_width : int
-// 	non_zero_slots : int = 1
-// 	// Add placeholder rune
-// 	{
-// 		placeholder_slot := get_rune_bitmap(font, 0, &arena) or_return
-// 		placeholder_slot.codepoint = -1
-// 		append(&raw_glyphs, placeholder_slot)
-// 		total_width += placeholder_slot.width
-// 	}
-//
-// 	start := time.now()
-// 	// Render slots bitmaps
-// 	for off in 0..<rune(glyph_count) {
-// 		slot : RawGlyph
-// 		err : mem.Allocator_Error
-//
-// 		r := base + off
-// 		if idx := ttf.FindGlyphIndex(&font.info, r); idx != 0 {
-// 			slot, err = get_rune_bitmap(font, base + off, &arena)
-// 			if err != nil { continue }
-// 			total_width += int(slot.width)
-// 			non_zero_slots += 1
-// 		}
-// 		append(&raw_glyphs, slot)
-// 	}
-// 	fmt.println("Rendering Peak:", arena.peak_used / mem.Kilobyte, "KiB", "Took:", time.since(start))
-//
-// 	assert(len(raw_glyphs) == glyph_count + 1, "Did not create all glyphs, maybe reserved space is too small?")
-//
-// 	// Initialize atlas
-// 	{
-// 		atlas.glyphs = make([]AtlasSlot, len(raw_glyphs)) or_return
-// 		atlas.base_glyph = base
-// 		atlas.font = font
-//
-// 		atlas_width := f64(total_width / non_zero_slots) * math.sqrt(f64(non_zero_slots)) * 1.5
-// 		aw, ah := pack_atlas_rows(raw_glyphs[:], int(max(16, atlas_width)))
-//
-// 		atlas.pixels = make([]u8, aw * ah) or_return
-// 		atlas.width = aw
-// 		atlas.height = ah
-// 	}
-//
-// 	// Transfer temporary packed slots into final atlas bitmap
-// 	placeholder := raw_glyphs[0]
-// 	bad_chars := 0
-// 	defer fmt.println("Bad characters:", bad_chars)
-// 	for &slot, i in atlas.glyphs {
-// 		packed_slot := raw_glyphs[i]
-//
-// 		if packed_slot.width == 0 && packed_slot.height == 0 {
-// 			bad_chars += 1
-// 			atlas.glyphs[i] = AtlasSlot {
-// 				glyph_offset = placeholder.glyph_offset,
-// 				atlas_offset = placeholder.atlas_offset,
-// 				width = placeholder.width,
-// 				height = placeholder.height,
-// 				codepoint = packed_slot.codepoint,
-// 			}
-// 			continue
-// 		}
-//
-// 		slot.width = packed_slot.width
-// 		slot.height = packed_slot.height
-// 		slot.atlas_offset = packed_slot.atlas_offset
-// 		slot.glyph_offset = packed_slot.glyph_offset
-// 		slot.codepoint = packed_slot.codepoint
-//
-// 		// Copy bitmap into apropriate slot
-// 		for y in 0..<slot.height {
-// 			for x in 0..<slot.width {
-// 				ax, ay := int(x + packed_slot.atlas_offset.x), int(y + packed_slot.atlas_offset.y)
-// 				atlas.pixels[atlas.width * ay + ax] = packed_slot.pixels[packed_slot.width * y + x]
-// 			}
-// 		}
-// 	}
-//
-// 	return
-// }
+atlas_create :: proc(glyph_cap := DEFAULT_CACHE_CAPACITY) -> (atlas: Glyph_Atlas, err: mem.Allocator_Error) {
+	atlas.glyphs = make(map[rune]Glyph_Atlas_Slot, DEFAULT_CACHE_CAPACITY) or_return
+	return
+}
 
-// draw_atlas_grid :: proc(atlas: GlyphAtlas, pos: [2]int){
-// 	rl.DrawRectangleLines(i32(pos.x), i32(pos.y), i32(atlas.width), i32(atlas.height), rl.RED)
-//
-// 	for glyph in atlas.glyphs {
-// 		off := glyph.atlas_offset
-//
-// 		rl.DrawRectangleLines(i32(glyph.atlas_offset.x + pos.x), i32(glyph.atlas_offset.y + pos.y), i32(glyph.width), i32(glyph.height),
-// 			{0x30, 0xfe, 0xfe, 0xff})
-// 	}
-// }
+atlas_destroy :: proc(atlas: ^Glyph_Atlas){
+	delete(atlas.glyphs)
+	delete(atlas.pixels)
+}
 
-as_texture :: proc(atlas: GlyphAtlas) -> rl.Texture {
+RECOMMENDED_ATLAS_TEMP_SIZE :: 128 * mem.Kilobyte
+
+font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena, allocator := context.allocator) -> (atlas: Glyph_Atlas, err: mem.Allocator_Error){
+	arena_restore := mem.begin_arena_temp_memory(temp_arena)
+	defer mem.end_arena_temp_memory(arena_restore)
+	defer fmt.println("Peak usage:", temp_arena.peak_used / mem.Kilobyte, "KiB")
+
+	mem_remaining := len(temp_arena.data) - temp_arena.offset
+	when ODIN_DEBUG {
+		ensure(mem_remaining >= RECOMMENDED_ATLAS_TEMP_SIZE, "Arena is smaller than the recommended size to generate a font atlas")
+	}
+	context.temp_allocator = mem.arena_allocator(temp_arena)
+
+	atlas = atlas_create(len(font.sdf_cache) + 1) or_return
+	// IMPORTANT: The bitmap pixel rendering is deferred to when copying the bitmap to the atlas to avoid excessive memory usage.
+	//            We do not need the pixels to pack them as the bounding boxes are defined by the signed distance fields.
+	packed_bitmaps := make([dynamic]Glyph_Bitmap, 0, len(font.sdf_cache) + 1, context.temp_allocator) or_return
+
+	total_sdf_width, total_sdf_count : i32
+
+	for codepoint, sdf in font.sdf_cache {
+		if raw_data(sdf.values) == raw_data(font.placeholder.values){
+			continue
+		}
+		bmap := Glyph_Bitmap{
+			glyph_offset = sdf.offset,
+			width = sdf.width,
+			height = sdf.height,
+			codepoint = codepoint,
+		}
+		append(&packed_bitmaps, bmap)
+		total_sdf_width += bmap.width
+		total_sdf_count += 1
+	}
+
+	placeholder_bmap := render_bitmap(font.placeholder, font.sharpness, context.temp_allocator) or_return
+	append(&packed_bitmaps, placeholder_bmap)
+
+	desired_atlas_width := 1.5*math.sqrt(f64(len(packed_bitmaps))) * f64(total_sdf_width) / f64(total_sdf_count)
+
+	aw, ah := pack_atlas_rows(packed_bitmaps[:], i32(desired_atlas_width))
+
+	atlas.pixels = make([]u8, aw * ah) or_return
+	atlas.width  = aw
+	atlas.height = ah
+
+	for _, i in packed_bitmaps {
+		restore_point := temp_arena.offset
+		defer temp_arena.offset = restore_point
+	
+		bmap := render_bitmap(font, packed_bitmaps[i].codepoint, context.temp_allocator) or_return
+		bmap.atlas_offset = packed_bitmaps[i].atlas_offset
+
+		slot := Glyph_Atlas_Slot{
+			atlas_offset = bmap.atlas_offset,
+			glyph_offset = bmap.glyph_offset,
+			width = bmap.width,
+			height = bmap.height,
+		}
+
+		atlas.glyphs[bmap.codepoint] = slot
+
+		// Copy bitmap into apropriate slot
+		for y in 0..<slot.height {
+			for x in 0..<slot.width {
+				apos := bmap.atlas_offset + [2]i32{x, y}
+				atlas.pixels[atlas.width * apos.y + apos.x] = bmap.pixels[bmap.width * y + x]
+			}
+		}
+	}
+
+	return
+}
+
+draw_atlas_grid :: proc(atlas: Glyph_Atlas, pos: [2]i32){
+	rl.DrawRectangleLines(i32(pos.x), i32(pos.y), i32(atlas.width), i32(atlas.height), rl.RED)
+
+	for _, glyph in atlas.glyphs {
+		off := glyph.atlas_offset
+
+		rl.DrawRectangleLines(i32(glyph.atlas_offset.x + pos.x), i32(glyph.atlas_offset.y + pos.y), i32(glyph.width), i32(glyph.height),
+			{0x30, 0xfe, 0xfe, 0xff})
+	}
+}
+
+as_texture :: proc(atlas: Glyph_Atlas) -> rl.Texture {
 	img := rl.Image {
 		data = raw_data(atlas.pixels),
 		width = i32(atlas.width),
@@ -320,24 +328,83 @@ as_texture :: proc(atlas: GlyphAtlas) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
-FONT :: #load("jetbrains.ttf", []byte)
+font_sdf_memory_usage :: proc(font: Font) -> int {
+	total := 0
+	for codepoint, sdf in font.sdf_cache {
+		total += slice.size(sdf.values) + size_of(Distance_Field)
+	}
+	return total
+}
+
+atlas_memory_usage :: proc(atlas: Glyph_Atlas) -> int {
+	total := int(atlas.width * atlas.height)
+	for codepoint, slot in atlas.glyphs {
+		total += size_of(Glyph_Atlas_Slot)
+	}
+	return total
+}
+
+sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
+	img := rl.Image{
+		data = raw_data(f.values),
+		width = f.width,
+		height = f.height,
+		mipmaps = 1,
+		format = .UNCOMPRESSED_GRAYSCALE,
+	}
+
+	return rl.LoadTextureFromImage(img)
+}
+
+FONT :: #load("noto.ttf", []byte)
 
 main :: proc(){
 	rl.InitWindow(1200, 800, "font render")
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
-	font, ok := font_load(FONT, 24)
+	font, ok := font_load(FONT, 64)
+	defer font_destroy(&font)
 	font.edge_value = 0.52
-	font.sharpness = 12.1
+	// font.dist_scale = 1.2
+	// font.sharpness = 7.0
+	// font.sharpness = 12.1
 	ensure(ok, "Failed to laod font")
 
-	// tex := as_texture(atlas)
+	{
+		beg := time.now()
+		/* Latin1   */ for r in 0x0000..<0x00ff { get_rune_sdf(&font, rune(r)) }
+		/* Latin+   */ for r in 0x0180..<0x02af { get_rune_sdf(&font, rune(r)) }
+		/* Greek    */ for r in 0x0370..<0x03ff { get_rune_sdf(&font, rune(r)) }
+		/* Cyrillic */ for r in 0x0400..<0x04ff { get_rune_sdf(&font, rune(r)) }
+		/* Armenian */ for r in 0x0530..<0x058f { get_rune_sdf(&font, rune(r)) }
+		/* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(&font, rune(r)) }
+		/* Math+    */ for r in 0x2a00..<0x2aff { get_rune_sdf(&font, rune(r)) }
+		fmt.println("Fresh SDF:", time.since(beg))
+	}
+
+	atlas_arena : mem.Arena
+	{
+		@static atlas_arena_mem : [2 * mem.Megabyte]byte
+		mem.arena_init(&atlas_arena, atlas_arena_mem[:])
+	}
+
+	beg := time.now()
+	atlas, _ := font_generate_atlas(&font, &atlas_arena)
+	fmt.println("Atlas generation:", time.since(beg))
+	defer atlas_destroy(&atlas)
+
+	tex := as_texture(atlas)
+	fmt.println("Glyphs loaded:", len(atlas.glyphs))
+	fmt.println("Glyphs cap:", cap(font.sdf_cache))
+	fmt.println("SDF Mem usage:", font_sdf_memory_usage(font) / mem.Kilobyte, "KiB")
+	fmt.println("Atlas Mem usage:", atlas_memory_usage(atlas) / mem.Kilobyte, "KiB")
+
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
-		// rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xff, 0xff, 0xff, 0xff})
-		// draw_atlas_grid(atlas, {10, 10})
+		rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xdc, 0xdc, 0xdc, 0xff})
+		draw_atlas_grid(atlas, {10, 10})
 		rl.EndDrawing()
 	}
 }
