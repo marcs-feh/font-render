@@ -59,7 +59,7 @@ Glyph_Atlas :: struct {
 	height: i32,
 }
 
-PLACEHOLDER_RUNE :: -1
+PLACEHOLDER_RUNE :: 0
 
 get_rune_sdf :: proc(font: ^Font, codepoint: rune) -> (field: Distance_Field, err: mem.Allocator_Error) {
 	context.allocator = font.allocator
@@ -120,7 +120,7 @@ render_bitmap_sdf :: proc(sdf: Distance_Field, sharpness: f32, allocator := cont
 	glyph.pixels = make([]u8, sdf.width * sdf.height) or_return
 	glyph.width  = sdf.width
 	glyph.height = sdf.height
-	glyph.glyph_offset = {auto_cast sdf.offset.x, auto_cast  sdf.offset.y}
+	glyph.glyph_offset = sdf.offset
 	glyph.codepoint = sdf.codepoint
 
 	for sv, i in sdf.values {
@@ -310,20 +310,82 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena = nil) -> (atlas
 
 font_update_atlas :: proc(font: ^Font) -> (err: mem.Allocator_Error) {
 	context.allocator = font.allocator
-	atlas := atlas_create() or_return
+	atlas := font_generate_atlas(font, nil) or_return
 	atlas_destroy(&font.atlas)
 	font.atlas = atlas
 	return
 }
 
-render_text :: proc(font: ^Font, text: string, origin: [2]int){
+import "core:unicode/utf8"
+
+Glyph_Rect :: struct {
+	draw_offset: [2]i32,
+	atlas_offset: [2]i32,
+	width: i32,
+	height: i32,
+	codepoint: rune,
+}
+
+Box :: struct {
+	using pos: [2]i32,
+	width, height: i32,
+}
+
+render_text :: proc(font: ^Font, text: string) -> (positions: []Glyph_Rect, bounds: Box) {
+	runes := utf8.rune_count(text)
+	rects := make([dynamic]Glyph_Rect, 0, runes)
+
 	scale := ttf.ScaleForPixelHeight(&font.info, font.size)
-	x := origin.x
+
+	x_offset, line_offset : i32
+	prev_width : i32 = 0
 
 	for char, i in text {
 		advance, lsb : i32
 		ttf.GetCodepointHMetrics(&font.info, char, &advance, &lsb)
+		advance = i32(f32(advance) * scale)
+		lsb = i32(f32(lsb) * scale)
+
+		slot, ok := font.atlas.glyphs[char]
+		if !ok {
+			slot = font.atlas.glyphs[PLACEHOLDER_RUNE]
+		}
+
+		// Add kerning
+		next_i := min(len(text) - 1, i + 1)
+		kern_adv := f32(ttf.GetGlyphKernAdvance(&font.info, i32(char), i32(text[next_i]))) * scale
+		x_offset += i32(math.round(kern_adv))
+		
+		rect := Glyph_Rect {
+			codepoint = char,
+			atlas_offset = slot.atlas_offset,
+			draw_offset = [2]i32{slot.glyph_offset.x + x_offset, slot.glyph_offset.y + line_offset},
+			width = slot.width,
+			height = slot.height,
+		}
+
+  		x_offset += advance + lsb
+		y_offset := slot.glyph_offset.y + line_offset
+
+		append(&rects, rect)
 	}
+
+	x0, x1 := max(i32), min(i32)
+	y0, y1 := max(i32), min(i32)
+	for rect in rects {
+		fmt.println(rect.codepoint, rect.draw_offset)
+		x0 = min(x0, rect.draw_offset.x)
+		x1 = max(x1, rect.draw_offset.x + rect.width)
+
+		y0 = min(y0, rect.draw_offset.y)
+		y1 = max(y1, rect.draw_offset.y + rect.height)
+	}
+
+	bounds.width  = x1 - x0
+	bounds.height = y1 - y0
+	bounds.pos    = {x0, y0}
+	assert(len(rects) == cap(rects))
+	return rects[:], bounds
 }
 
 @private DEFAULT_TEMP_ARENA_MEMORY : [FONT_RENDER_SCRATCH_SPACE]byte
@@ -338,7 +400,7 @@ init_scratch_space :: proc(){
 	initialized = true
 }
 
-FONT :: #load("jetbrains.ttf", []byte)
+FONT :: #load("noto.ttf", []byte)
 
 sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
 	img := rl.Image{
@@ -362,12 +424,21 @@ draw_atlas_grid :: proc(atlas: Glyph_Atlas, pos: [2]i32){
 }
 
 as_texture :: proc(atlas: Glyph_Atlas) -> rl.Texture {
+	GSAlpha :: [2]u8
+
+	bitmap := make([]GSAlpha, len(atlas.pixels))
+	defer delete(bitmap)
+
+	for val, i in atlas.pixels {
+		bitmap[i] = {0xff, val}
+	}
+
 	img := rl.Image {
-		data = raw_data(atlas.pixels),
+		data = raw_data(bitmap),
 		width = i32(atlas.width),
 		height = i32(atlas.height),
 		mipmaps = 1,
-		format = .UNCOMPRESSED_GRAYSCALE,
+		format = .UNCOMPRESSED_GRAY_ALPHA,
 	}
 
 	return rl.LoadTextureFromImage(img)
@@ -379,7 +450,7 @@ main :: proc(){
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
-	font, ok := font_load(FONT, 64)
+	font, ok := font_load(FONT, 54)
 	defer font_destroy(&font)
 	font.edge_value = 0.52
 	// font.dist_scale = 1.2
@@ -390,29 +461,69 @@ main :: proc(){
 	{
 		beg := time.now()
 		/* Latin1   */ for r in 0x0000..<0x00ff { get_rune_sdf(&font, rune(r)) }
-		/* Latin+   */ for r in 0x0180..<0x02af { get_rune_sdf(&font, rune(r)) }
-		/* Greek    */ for r in 0x0370..<0x03ff { get_rune_sdf(&font, rune(r)) }
-		/* Cyrillic */ for r in 0x0400..<0x04ff { get_rune_sdf(&font, rune(r)) }
-		/* Armenian */ for r in 0x0530..<0x058f { get_rune_sdf(&font, rune(r)) }
-		/* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(&font, rune(r)) }
-		/* Math+    */ for r in 0x2a00..<0x2aff { get_rune_sdf(&font, rune(r)) }
+		// /* Latin+   */ for r in 0x0180..<0x02af { get_rune_sdf(&font, rune(r)) }
+		// /* Greek    */ for r in 0x0370..<0x03ff { get_rune_sdf(&font, rune(r)) }
+		// /* Cyrillic */ for r in 0x0400..<0x04ff { get_rune_sdf(&font, rune(r)) }
+		// /* Armenian */ for r in 0x0530..<0x058f { get_rune_sdf(&font, rune(r)) }
+		// /* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(&font, rune(r)) }
+		// /* Math+    */ for r in 0x2a00..<0x2aff { get_rune_sdf(&font, rune(r)) }
 		fmt.println("Fresh SDF:", time.since(beg))
 	}
 
 	beg := time.now()
-	atlas, _ := font_generate_atlas(&font)
+	font_update_atlas(&font)
 	fmt.println("Atlas generation:", time.since(beg))
-	defer atlas_destroy(&atlas)
 
-	tex := as_texture(atlas)
-	fmt.println("Glyphs loaded:", len(atlas.glyphs))
+	tex := as_texture(font.atlas)
+	fmt.println("Glyphs loaded:", len(font.atlas.glyphs))
 	fmt.println("Glyphs cap:", cap(font.sdf_cache))
 
+	rects, box := render_text(&font, "The quick brown fox jumped over the lazy dog")
+	// rects := render_text(&font, "AAA AAA")
+
+	fmt.println(box)
+	show_boxes := true
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
-		rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xdc, 0xdc, 0xdc, 0xff})
-		draw_atlas_grid(atlas, {10, 10})
+		
+		if rl.IsKeyPressed(.B){
+			show_boxes = !show_boxes
+		}
+
+		mouse_pos := rl.GetMousePosition()
+
+		for rect in rects {
+			texture_piece := rl.Rectangle{
+				x = f32(rect.atlas_offset.x),
+				y = f32(rect.atlas_offset.y),
+				width = f32(rect.width),
+				height = f32(rect.height),
+			}
+
+			draw_offset := rl.Vector2{f32(rect.draw_offset.x - box.x), f32(rect.draw_offset.y - box.y)}
+			pos := mouse_pos + draw_offset
+
+			rl.DrawTextureRec(tex, texture_piece, pos, {0xff, 0xff, 0xff, 0xff})
+
+			rl_rect := rl.Rectangle{
+				x = pos.x,
+				y = pos.y,
+				width = f32(rect.width),
+				height = f32(rect.height),
+			}
+
+			if show_boxes {
+				rl.DrawRectangleLinesEx(rl_rect, 1, rl.YELLOW)
+				rl.DrawCircle(i32(pos.x), i32(pos.y), 2, rl.MAGENTA)
+			}
+		}
+		if show_boxes {
+			rl.DrawRectangleLines(i32(mouse_pos.x), i32(mouse_pos.y), box.width, box.height, rl.RED)
+			rl.DrawCircle(i32(mouse_pos.x), i32(mouse_pos.y), 2, rl.GREEN)
+		}
+		// rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xdc, 0xdc, 0xdc, 0xff})
+		// draw_atlas_grid(atlas, {10, 10})
 		rl.EndDrawing()
 	}
 }
