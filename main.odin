@@ -10,18 +10,21 @@ import rl "vendor:raylib"
 import ttf "vendor:stb/truetype"
 
 // TODO: have font own a copy of the ttf raw data
-// TODO: replace font map with sorted list + binary search?
+
+FONT_RENDER_SCRATCH_SPACE :: #config(FONT_RENDER_SCRATCH_SPACE, 2 * mem.Megabyte)
 
 Font :: struct {
 	info: ttf.fontinfo,
 	sdf_cache: map[rune]Distance_Field,
 	placeholder: Distance_Field,
-	allocator: mem.Allocator,
+	atlas: Glyph_Atlas,
 
 	size: f32,
 	edge_value: f32,
 	dist_scale: f32,
 	sharpness: f32,
+
+	allocator: mem.Allocator,
 }
 
 Distance_Field :: struct {
@@ -163,7 +166,7 @@ font_load :: proc(data: []byte, size: f32, allocator := context.allocator) -> (f
 	if mem_err != nil {
 		ok = false
 	}
-	
+
 	font.placeholder, mem_err = render_sdf(&font, -1, font.allocator)
 	if mem_err != nil {
 		ok = false
@@ -188,7 +191,6 @@ font_destroy :: proc(font: ^Font){
 	}
 	delete(font.sdf_cache)
 }
-
 
 @(require_results, private)
 pack_atlas_rows :: proc(glyphs: []Glyph_Bitmap, max_width: i32) -> (i32, i32){
@@ -220,8 +222,8 @@ pack_atlas_rows :: proc(glyphs: []Glyph_Bitmap, max_width: i32) -> (i32, i32){
 	return max_width + 2, total_height + 2
 }
 
-atlas_create :: proc(glyph_cap := DEFAULT_CACHE_CAPACITY) -> (atlas: Glyph_Atlas, err: mem.Allocator_Error) {
-	atlas.glyphs = make(map[rune]Glyph_Atlas_Slot, DEFAULT_CACHE_CAPACITY) or_return
+atlas_create :: proc(allocator := context.allocator, glyph_cap := DEFAULT_CACHE_CAPACITY) -> (atlas: Glyph_Atlas, err: mem.Allocator_Error) {
+	atlas.glyphs = make(map[rune]Glyph_Atlas_Slot, DEFAULT_CACHE_CAPACITY, allocator) or_return
 	return
 }
 
@@ -230,22 +232,24 @@ atlas_destroy :: proc(atlas: ^Glyph_Atlas){
 	delete(atlas.pixels)
 }
 
-RECOMMENDED_ATLAS_TEMP_SIZE :: 128 * mem.Kilobyte
+font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena = nil) -> (atlas: Glyph_Atlas, err: mem.Allocator_Error){
+	context.allocator = font.allocator
+	temp_arena := temp_arena if temp_arena != nil else &DEFAULT_TEMP_ARENA
 
-font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena, allocator := context.allocator) -> (atlas: Glyph_Atlas, err: mem.Allocator_Error){
 	arena_restore := mem.begin_arena_temp_memory(temp_arena)
 	defer mem.end_arena_temp_memory(arena_restore)
+
 	defer fmt.println("Peak usage:", temp_arena.peak_used / mem.Kilobyte, "KiB")
 
 	when ODIN_DEBUG {
 		mem_remaining := len(temp_arena.data) - temp_arena.offset
-		ensure(mem_remaining >= RECOMMENDED_ATLAS_TEMP_SIZE, "Arena is smaller than the recommended size to generate a font atlas")
+		ensure(mem_remaining >= FONT_RENDER_SCRATCH_SPACE, "Arena is smaller than the recommended size to generate a font atlas")
 	}
 	context.temp_allocator = mem.arena_allocator(temp_arena)
 
-	atlas = atlas_create(len(font.sdf_cache) + 1) or_return
-	// IMPORTANT: The bitmap pixel rendering is deferred to when copying the bitmap to the atlas to avoid excessive memory usage.
-	//            We do not need the pixels to pack them as the bounding boxes are defined by the signed distance fields.
+	atlas = atlas_create(font.allocator, len(font.sdf_cache) + 1) or_return
+	// NOTE: The bitmap pixel rendering is deferred to when copying the bitmap to the atlas to avoid excessive memory usage.
+	//       We do not need the pixels to pack them as the bounding boxes are defined by the signed distance fields.
 	packed_bitmaps := make([dynamic]Glyph_Bitmap, 0, len(font.sdf_cache) + 1, context.temp_allocator) or_return
 
 	total_sdf_width, total_sdf_count : i32
@@ -279,7 +283,7 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena, allocator := co
 	for _, i in packed_bitmaps {
 		restore_point := temp_arena.offset
 		defer temp_arena.offset = restore_point
-	
+
 		bmap := render_bitmap(font, packed_bitmaps[i].codepoint, context.temp_allocator) or_return
 		bmap.atlas_offset = packed_bitmaps[i].atlas_offset
 
@@ -304,6 +308,50 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena, allocator := co
 	return
 }
 
+font_update_atlas :: proc(font: ^Font) -> (err: mem.Allocator_Error) {
+	context.allocator = font.allocator
+	atlas := atlas_create() or_return
+	atlas_destroy(&font.atlas)
+	font.atlas = atlas
+	return
+}
+
+render_text :: proc(font: ^Font, text: string, origin: [2]int){
+	scale := ttf.ScaleForPixelHeight(&font.info, font.size)
+	x := origin.x
+
+	for char, i in text {
+		advance, lsb : i32
+		ttf.GetCodepointHMetrics(&font.info, char, &advance, &lsb)
+	}
+}
+
+@private DEFAULT_TEMP_ARENA_MEMORY : [FONT_RENDER_SCRATCH_SPACE]byte
+
+@private DEFAULT_TEMP_ARENA : mem.Arena
+
+@(init)
+init_scratch_space :: proc(){
+	@static initialized := false
+	ensure(!initialized, "Font rendering module has already been i nitialized")
+	mem.arena_init(&DEFAULT_TEMP_ARENA, DEFAULT_TEMP_ARENA_MEMORY[:])
+	initialized = true
+}
+
+FONT :: #load("jetbrains.ttf", []byte)
+
+sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
+	img := rl.Image{
+		data = raw_data(f.values),
+		width = f.width,
+		height = f.height,
+		mipmaps = 1,
+		format = .UNCOMPRESSED_GRAYSCALE,
+	}
+
+	return rl.LoadTextureFromImage(img)
+}
+
 draw_atlas_grid :: proc(atlas: Glyph_Atlas, pos: [2]i32){
 	rl.DrawRectangleLines(i32(pos.x), i32(pos.y), i32(atlas.width), i32(atlas.height), rl.RED)
 
@@ -325,35 +373,6 @@ as_texture :: proc(atlas: Glyph_Atlas) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
-font_sdf_memory_usage :: proc(font: Font) -> int {
-	total := 0
-	for _, sdf in font.sdf_cache {
-		total += slice.size(sdf.values) + size_of(Distance_Field)
-	}
-	return total
-}
-
-atlas_memory_usage :: proc(atlas: Glyph_Atlas) -> int {
-	total := int(atlas.width * atlas.height)
-	for _ in atlas.glyphs {
-		total += size_of(Glyph_Atlas_Slot)
-	}
-	return total
-}
-
-sdf_texture :: proc(f: Distance_Field) -> rl.Texture {
-	img := rl.Image{
-		data = raw_data(f.values),
-		width = f.width,
-		height = f.height,
-		mipmaps = 1,
-		format = .UNCOMPRESSED_GRAYSCALE,
-	}
-
-	return rl.LoadTextureFromImage(img)
-}
-
-FONT :: #load("jetbrains.ttf", []byte)
 
 main :: proc(){
 	rl.InitWindow(1200, 800, "font render")
@@ -380,22 +399,14 @@ main :: proc(){
 		fmt.println("Fresh SDF:", time.since(beg))
 	}
 
-	atlas_arena : mem.Arena
-	{
-		@static atlas_arena_mem : [2 * mem.Megabyte]byte
-		mem.arena_init(&atlas_arena, atlas_arena_mem[:])
-	}
-
 	beg := time.now()
-	atlas, _ := font_generate_atlas(&font, &atlas_arena)
+	atlas, _ := font_generate_atlas(&font)
 	fmt.println("Atlas generation:", time.since(beg))
 	defer atlas_destroy(&atlas)
 
 	tex := as_texture(atlas)
 	fmt.println("Glyphs loaded:", len(atlas.glyphs))
 	fmt.println("Glyphs cap:", cap(font.sdf_cache))
-	fmt.println("SDF Mem usage:", font_sdf_memory_usage(font) / mem.Kilobyte, "KiB")
-	fmt.println("Atlas Mem usage:", atlas_memory_usage(atlas) / mem.Kilobyte, "KiB")
 
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
