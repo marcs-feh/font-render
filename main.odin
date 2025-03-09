@@ -615,8 +615,6 @@ int main(){
 			rl.DrawRectangleLines(i32(mouse_pos.x), i32(mouse_pos.y), box.width, box.height, {0x30, 0xee, 0xee, 0x7f})
 			rl.DrawCircle(i32(mouse_pos.x), i32(mouse_pos.y), 2, {0x30, 0xee, 0x30, 0xff})
 		}
-		// rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xdc, 0xdc, 0xdc, 0xff})
-		// draw_atlas_grid(font.atlas, {10, 10})
 		rl.EndDrawing()
 	}
 }
