@@ -21,13 +21,16 @@ Font :: struct {
 	placeholder: Distance_Field,
 	atlas: Glyph_Atlas,
 
+	raster_passes: []Raster_Pass,
+
 	size: f32,
 	edge_value: f32,
 	dist_scale: f32,
-	sharpness: f32,
 
 	allocator: mem.Allocator,
 }
+
+Raster_Pass :: #type proc(field: Distance_Field) -> Distance_Field
 
 // A signed distance field for a codepoint, the higher the value the "more inside" it is inside the glyph's contour
 Distance_Field :: struct {
@@ -120,31 +123,56 @@ render_sdf :: proc(font: ^Font, codepoint: rune, allocator := context.allocator)
 	return
 }
 
-
 // Render a new bitmap from an signed distance field
 @(require_results)
-render_bitmap_sdf :: proc(sdf: Distance_Field, sharpness: f32, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
-	context.allocator = allocator
-	glyph.pixels = make([]u8, sdf.width * sdf.height) or_return
-	glyph.width  = sdf.width
-	glyph.height = sdf.height
-	glyph.glyph_offset = sdf.offset
-	glyph.codepoint = sdf.codepoint
+render_bitmap_sdf :: proc(sdf: Distance_Field, passes: []Raster_Pass, arena: ^mem.Arena, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
+	region := mem.begin_arena_temp_memory(arena)
+	defer mem.end_arena_temp_memory(region)
 
-	for sv, i in sdf.values {
-		v := f32(sv) / 0xff
-		px := u8(clamp(0, 0xff * sigmoid_activate(v, sharpness), 255))
-		glyph.pixels[i] = px
+	context.allocator = allocator
+	context.temp_allocator = mem.arena_allocator(arena)
+
+	values_copy := slice.clone(sdf.values, context.temp_allocator) or_return
+	field := sdf
+	field.values = values_copy
+
+	glyph.pixels       = make([]u8, field.width * field.height) or_return
+	glyph.width        = field.width
+	glyph.height       = field.height
+	glyph.glyph_offset = field.offset
+	glyph.codepoint    = field.codepoint
+
+	for pass in passes {
+		field = pass(field)
 	}
+
+	copy(glyph.pixels, field.values)
+
 
 	return
 }
 
+sigmoid_pass :: proc(field: Distance_Field) -> Distance_Field {
+	sharpness :: 3.0
+
+	sigmoid_activate :: proc(v: f32, s: f32) -> f32 {
+		return 1.0 / (1 + math.exp(-s * (v - 0.5)))
+	}
+
+	for sv, i in field.values {
+		v := f32(sv) / 0xff
+		px := u8(clamp(0, 0xff * sigmoid_activate(v, sharpness), 255))
+		field.values[i] = px
+	}
+
+	return field
+}
+
 // Render a new bitmap for a codepoint from font
-render_bitmap_rune :: proc(font: ^Font, codepoint: rune, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
+render_bitmap_rune :: proc(font: ^Font, codepoint: rune, arena: ^mem.Arena, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
 	context.allocator = allocator
 	sdf := get_rune_sdf(font, codepoint) or_return
-	return render_bitmap_sdf(sdf, font.sharpness)
+	return render_bitmap_sdf(sdf, font.raster_passes, arena)
 }
 
 render_bitmap :: proc {
@@ -159,9 +187,8 @@ font_load :: proc(data: []byte, size: f32, allocator := context.allocator) -> (f
 
 	ok = true
 	font.size = size
-	font.edge_value = 0.63
-	font.dist_scale = 0.61
-	font.sharpness = 9.25
+	font.edge_value = 0.51
+	font.dist_scale = 0.5
 	font.allocator = allocator
 
 	context.allocator = allocator
@@ -201,9 +228,6 @@ font_destroy :: proc(font: ^Font){
 	delete(font.sdf_store)
 }
 
-sigmoid_activate :: proc(v: f32, s: f32) -> f32 {
-	return 1.0 / (1 + math.exp(-s * (v - 0.5)))
-}
 
 @(require_results, private)
 pack_atlas_rows :: proc(glyphs: []Glyph_Bitmap, max_width: i32) -> (width, height: i32) {
@@ -286,7 +310,7 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena = nil) -> (atlas
 		total_sdf_count += 1
 	}
 
-	placeholder_bmap := render_bitmap(font.placeholder, font.sharpness, context.temp_allocator) or_return
+	placeholder_bmap := render_bitmap_sdf(font.placeholder, font.raster_passes, temp_arena, context.temp_allocator) or_return
 	append(&packed_bitmaps, placeholder_bmap)
 
 	desired_atlas_width := 1.5*math.sqrt(f64(len(packed_bitmaps))) * f64(total_sdf_width) / f64(total_sdf_count)
@@ -301,7 +325,7 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena = nil) -> (atlas
 		loop_region := mem.begin_arena_temp_memory(temp_arena)
 		defer mem.end_arena_temp_memory(loop_region)
 
-		bmap := render_bitmap(font, packed_bitmaps[i].codepoint, context.temp_allocator) or_return
+		bmap := render_bitmap_rune(font, packed_bitmaps[i].codepoint, temp_arena, context.temp_allocator) or_return
 		bmap.atlas_offset = packed_bitmaps[i].atlas_offset
 
 		slot := Glyph_Atlas_Slot{
@@ -373,6 +397,9 @@ render_text :: proc(font: ^Font, text: string, line_height: i32 = -1) -> (positi
 			x_offset = 0
 			line_offset += line_height
 			continue
+		}
+		else if char == ' ' {
+			slot.height = 0
 		}
 
 		// Add kerning
@@ -467,31 +494,37 @@ as_texture :: proc(atlas: Glyph_Atlas) -> rl.Texture {
 	return rl.LoadTextureFromImage(img)
 }
 
+font_refresh_sdf_store :: proc(font: ^Font) -> (err: mem.Allocator_Error){
+	context.allocator = font.allocator
+	for codepoint, field in font.sdf_store {
+		delete(field.values)
+		font.sdf_store[codepoint] = render_sdf(font, codepoint) or_return
+	}
+	return
+}
 
 main :: proc(){
-	rl.InitWindow(1200, 800, "font render")
+	rl.InitWindow(1200, 600, "font render")
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
-	font, ok := font_load(FONT, 18)
-	defer font_destroy(&font)
-	font.edge_value = 0.57
-	// font.dist_scale = 1.2
-	// font.sharpness = 7.0
-	// font.sharpness = 12.1
-	ensure(ok, "Failed to laod font")
-
-	{
-		beg := time.now()
-		/* Latin1   */ for r in 0x0000..<0x00ff { get_rune_sdf(&font, rune(r)) }
-		/* Latin+   */ for r in 0x0180..<0x02af { get_rune_sdf(&font, rune(r)) }
-		/* Greek    */ for r in 0x0370..<0x03ff { get_rune_sdf(&font, rune(r)) }
-		/* Cyrillic */ for r in 0x0400..<0x04ff { get_rune_sdf(&font, rune(r)) }
-		/* Armenian */ for r in 0x0530..<0x058f { get_rune_sdf(&font, rune(r)) }
-		/* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(&font, rune(r)) }
-		/* Math+    */ for r in 0x2a00..<0x2aff { get_rune_sdf(&font, rune(r)) }
-		fmt.println("Fresh SDF:", time.since(beg))
+	load_base_chars :: proc(font: ^Font){
+		/* Latin1   */ for r in 0x0000..<0x00ff { get_rune_sdf(font, rune(r)) }
+		// /* Latin+   */ for r in 0x0180..<0x02af { get_rune_sdf(font, rune(r)) }
+		// /* Greek    */ for r in 0x0370..<0x03ff { get_rune_sdf(font, rune(r)) }
+		// /* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(font, rune(r)) }
+		// /* Math+    */ for r in 0x2a00..<0x2aff { get_rune_sdf(font, rune(r)) }
 	}
+
+	font, ok := font_load(FONT, 16)
+	defer font_destroy(&font)
+	font.edge_value = 0.51
+	font.dist_scale = 0.62
+	font.raster_passes = {sigmoid_pass}
+	ensure(ok, "Failed to load font")
+
+	load_base_chars(&font)
+	font_update_atlas(&font)
 
 	beg := time.now()
 	font_update_atlas(&font)
@@ -518,12 +551,37 @@ int main(){
 
 	fmt.println(box)
 	show_boxes := true
+
+	font_changed := false
+
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
 		
 		if rl.IsKeyPressed(.B){
 			show_boxes = !show_boxes
+		}
+
+		switch {
+		case rl.IsKeyPressed(.J): font.edge_value -= 0.05; font_changed = true
+		case rl.IsKeyPressed(.K): font.edge_value += 0.05; font_changed = true
+		case rl.IsKeyPressed(.N): font.dist_scale -= 0.05; font_changed = true
+		case rl.IsKeyPressed(.M): font.dist_scale += 0.05; font_changed = true
+		}
+
+
+		if font_changed {
+			font_refresh_sdf_store(&font)
+			font_update_atlas(&font)
+
+			rl.UnloadTexture(tex)
+			tex = as_texture(font.atlas)
+			font_changed = false
+
+			fmt.println("--------------")
+			fmt.println("Edge Value:", font.edge_value)
+			fmt.println("Dist Scale:", font.dist_scale)
+			fmt.println("--------------")
 		}
 
 		mouse_pos := rl.GetMousePosition()
@@ -557,8 +615,8 @@ int main(){
 			rl.DrawRectangleLines(i32(mouse_pos.x), i32(mouse_pos.y), box.width, box.height, {0x30, 0xee, 0xee, 0x7f})
 			rl.DrawCircle(i32(mouse_pos.x), i32(mouse_pos.y), 2, {0x30, 0xee, 0x30, 0xff})
 		}
-		rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xdc, 0xdc, 0xdc, 0xff})
-		draw_atlas_grid(font.atlas, {10, 10})
+		// rl.DrawTextureEx(tex, {10, 10}, 0, 1, {0xdc, 0xdc, 0xdc, 0xff})
+		// draw_atlas_grid(font.atlas, {10, 10})
 		rl.EndDrawing()
 	}
 }
