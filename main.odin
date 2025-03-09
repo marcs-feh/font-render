@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:time"
 import "core:math"
 import "core:unicode/utf8"
+import "core:simd"
 
 import rl "vendor:raylib"
 import ttf "vendor:stb/truetype"
@@ -13,6 +14,14 @@ import ttf "vendor:stb/truetype"
 FONT_RENDER_SCRATCH_SPACE :: #config(FONT_RENDER_SCRATCH_SPACE, 1 * mem.Megabyte)
 
 FONT_RENDER_DEFAULT_CACHE_CAPACITY :: #config(FONT_RENDER_DEFAULT_CACHE_CAPACITY, 256)
+
+Byte_Block :: simd.u8x32
+
+bytes_make :: proc(width, height: int, allocator := context.allocator) -> (data: []u8, err: mem.Allocator_Error) {
+	n := width * height
+	data, err = mem.make_aligned([]u8, n, align_of(Byte_Block), allocator)
+	return
+}
 
 // Container for a specific TTF font
 Font :: struct {
@@ -22,6 +31,7 @@ Font :: struct {
 	atlas: Glyph_Atlas,
 
 	raster_passes: []Raster_Pass,
+	pass_variables: map[string]Pass_Value,
 
 	size: f32,
 	edge_value: f32,
@@ -30,7 +40,13 @@ Font :: struct {
 	allocator: mem.Allocator,
 }
 
-Raster_Pass :: #type proc(field: Distance_Field) -> Distance_Field
+Pass_Value :: union {
+	f64,
+	i64,
+	u8,
+}
+
+Raster_Pass :: #type proc(field: Distance_Field, vars: map[string]Pass_Value) -> Distance_Field
 
 // A signed distance field for a codepoint, the higher the value the "more inside" it is inside the glyph's contour
 Distance_Field :: struct {
@@ -112,7 +128,7 @@ render_sdf :: proc(font: ^Font, codepoint: rune, allocator := context.allocator)
 		return {}, .Out_Of_Memory
 	}
 
-	field.values = make([]u8, width * height, font.allocator) or_return
+	field.values = bytes_make(int(width), int(height), font.allocator) or_return
 	mem.copy_non_overlapping(raw_data(field.values), values, int(width * height))
 
 	field.codepoint = codepoint
@@ -123,46 +139,68 @@ render_sdf :: proc(font: ^Font, codepoint: rune, allocator := context.allocator)
 	return
 }
 
-// Render a new bitmap from an signed distance field
+// Render a new bitmap from an signed distance field and push it onto arena
 @(require_results)
-render_bitmap_sdf :: proc(sdf: Distance_Field, passes: []Raster_Pass, arena: ^mem.Arena, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
-	region := mem.begin_arena_temp_memory(arena)
-	defer mem.end_arena_temp_memory(region)
+render_bitmap_sdf :: proc(
+	sdf: Distance_Field,
+	passes: []Raster_Pass,
+	pass_variables: map[string]Pass_Value,
+	arena: ^mem.Arena
+) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error)
+{
+	context.allocator = mem.arena_allocator(arena)
 
-	context.allocator = allocator
-	context.temp_allocator = mem.arena_allocator(arena)
+	glyph.pixels       = bytes_make(int(sdf.width), int(sdf.height)) or_return
+	glyph.width        = sdf.width
+	glyph.height       = sdf.height
+	glyph.glyph_offset = sdf.offset
+	glyph.codepoint    = sdf.codepoint
 
-	values_copy := slice.clone(sdf.values, context.temp_allocator) or_return
-	field := sdf
-	field.values = values_copy
+	/* Create temp copy and apply passes */ {
+		region := mem.begin_arena_temp_memory(arena)
+		defer mem.end_arena_temp_memory(region)
+		values_copy := slice.clone(sdf.values, context.temp_allocator) or_return
+		field := sdf
+		field.values = values_copy
 
-	glyph.pixels       = make([]u8, field.width * field.height) or_return
-	glyph.width        = field.width
-	glyph.height       = field.height
-	glyph.glyph_offset = field.offset
-	glyph.codepoint    = field.codepoint
+		for pass in passes {
+			field = pass(field, pass_variables)
+		}
 
-	for pass in passes {
-		field = pass(field)
+		copy(glyph.pixels, field.values)
 	}
-
-	copy(glyph.pixels, field.values)
-
 
 	return
 }
 
-sigmoid_pass :: proc(field: Distance_Field) -> Distance_Field {
-	sharpness :: 3.0
+sigmoid :: proc(field: Distance_Field, vars: map[string]Pass_Value) -> Distance_Field {
+	sharpness, ok := vars["sigmoid.sharpness"].(f64)
+	if !ok { sharpness = 8.0 }
 
-	sigmoid_activate :: proc(v: f32, s: f32) -> f32 {
+	sigmoid_activate :: proc(v: f64, s: f64) -> f64 {
 		return 1.0 / (1 + math.exp(-s * (v - 0.5)))
 	}
 
-	for sv, i in field.values {
-		v := f32(sv) / 0xff
+	#no_bounds_check for sv, i in field.values {
+		v := f64(sv) / 0xff
 		px := u8(clamp(0, 0xff * sigmoid_activate(v, sharpness), 255))
 		field.values[i] = px
+	}
+
+	return field
+}
+
+threshold_low :: proc(field: Distance_Field, vars: map[string]Pass_Value) -> Distance_Field {
+	value: u8
+
+	if value_var, ok := vars["threshold_low.value"].(u8); ok {
+		value = value_var
+	}
+
+	#no_bounds_check for v, i in field.values {
+		if v < value {
+			field.values[i] = 0
+		}
 	}
 
 	return field
@@ -172,7 +210,7 @@ sigmoid_pass :: proc(field: Distance_Field) -> Distance_Field {
 render_bitmap_rune :: proc(font: ^Font, codepoint: rune, arena: ^mem.Arena, allocator := context.allocator) -> (glyph: Glyph_Bitmap, err: mem.Allocator_Error){
 	context.allocator = allocator
 	sdf := get_rune_sdf(font, codepoint) or_return
-	return render_bitmap_sdf(sdf, font.raster_passes, arena)
+	return render_bitmap_sdf(sdf, font.raster_passes, font.pass_variables, arena)
 }
 
 render_bitmap :: proc {
@@ -189,6 +227,7 @@ font_load :: proc(data: []byte, size: f32, allocator := context.allocator) -> (f
 	font.size = size
 	font.edge_value = 0.51
 	font.dist_scale = 0.5
+	font.pass_variables = make(map[string]Pass_Value)
 	font.allocator = allocator
 
 	context.allocator = allocator
@@ -227,7 +266,6 @@ font_destroy :: proc(font: ^Font){
 	}
 	delete(font.sdf_store)
 }
-
 
 @(require_results, private)
 pack_atlas_rows :: proc(glyphs: []Glyph_Bitmap, max_width: i32) -> (width, height: i32) {
@@ -277,15 +315,18 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena = nil) -> (atlas
 	context.allocator = font.allocator
 	temp_arena := temp_arena if temp_arena != nil else &DEFAULT_TEMP_ARENA
 
+	when ODIN_DEBUG {
+		time_start := time.now()
+		defer {
+			fmt.println("Atlas Generation info")
+			fmt.println("  Peak memory:", temp_arena.peak_used / mem.Kilobyte, "KiB")
+			fmt.println("  Total time:", time.since(time_start))
+		}
+	}
 	arena_restore := mem.begin_arena_temp_memory(temp_arena)
 	defer mem.end_arena_temp_memory(arena_restore)
 
-	defer fmt.println("Peak usage:", temp_arena.peak_used / mem.Kilobyte, "KiB")
 
-	when ODIN_DEBUG {
-		mem_remaining := len(temp_arena.data) - temp_arena.offset
-		ensure(mem_remaining >= FONT_RENDER_SCRATCH_SPACE, "Arena is smaller than the recommended size to generate a font atlas")
-	}
 	context.temp_allocator = mem.arena_allocator(temp_arena)
 
 	atlas = atlas_create(font.allocator, len(font.sdf_store) + 1) or_return
@@ -310,7 +351,7 @@ font_generate_atlas :: proc(font: ^Font, temp_arena: ^mem.Arena = nil) -> (atlas
 		total_sdf_count += 1
 	}
 
-	placeholder_bmap := render_bitmap_sdf(font.placeholder, font.raster_passes, temp_arena, context.temp_allocator) or_return
+	placeholder_bmap := render_bitmap_sdf(font.placeholder, font.raster_passes, font.pass_variables, temp_arena) or_return
 	append(&packed_bitmaps, placeholder_bmap)
 
 	desired_atlas_width := 1.5*math.sqrt(f64(len(packed_bitmaps))) * f64(total_sdf_width) / f64(total_sdf_count)
@@ -406,7 +447,7 @@ render_text :: proc(font: ^Font, text: string, line_height: i32 = -1) -> (positi
 		next_i := min(len(text) - 1, i + 1)
 		kern_adv := f32(ttf.GetGlyphKernAdvance(&font.info, i32(char), i32(text[next_i]))) * scale
 		x_offset += i32(math.round(kern_adv))
-		
+
 		rect := Glyph_Rect {
 			codepoint = char,
 			atlas_offset = slot.atlas_offset,
@@ -504,7 +545,7 @@ font_refresh_sdf_store :: proc(font: ^Font) -> (err: mem.Allocator_Error){
 }
 
 main :: proc(){
-	rl.InitWindow(1200, 600, "font render")
+	rl.InitWindow(900, 600, "font render")
     rl.SetWindowState({.WINDOW_RESIZABLE})
 	rl.SetTargetFPS(60)
 
@@ -512,15 +553,19 @@ main :: proc(){
 		/* Latin1   */ for r in 0x0000..<0x00ff { get_rune_sdf(font, rune(r)) }
 		// /* Latin+   */ for r in 0x0180..<0x02af { get_rune_sdf(font, rune(r)) }
 		// /* Greek    */ for r in 0x0370..<0x03ff { get_rune_sdf(font, rune(r)) }
-		// /* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(font, rune(r)) }
+		/* Math     */ for r in 0x2200..<0x22ff { get_rune_sdf(font, rune(r)) }
 		// /* Math+    */ for r in 0x2a00..<0x2aff { get_rune_sdf(font, rune(r)) }
 	}
 
-	font, ok := font_load(FONT, 16)
+	font, ok := font_load(FONT, 48)
 	defer font_destroy(&font)
+
 	font.edge_value = 0.51
-	font.dist_scale = 0.62
-	font.raster_passes = {sigmoid_pass}
+	font.dist_scale = 0.60
+	font.pass_variables["sigmoid.sharpness"] = 8.3
+	font.pass_variables["threshold_low.value"] = u8(0x30)
+	font.raster_passes = {sigmoid, threshold_low}
+
 	ensure(ok, "Failed to load font")
 
 	load_base_chars(&font)
@@ -557,18 +602,29 @@ int main(){
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.BLACK)
-		
+
 		if rl.IsKeyPressed(.B){
 			show_boxes = !show_boxes
 		}
 
 		switch {
+			case rl.IsKeyPressed(.I):
+				s, _ := font.pass_variables["sigmoid.sharpness"].(f64)
+				s -= 0.25
+				font.pass_variables["sigmoid.sharpness"] = s
+				font_changed = true
+			case rl.IsKeyPressed(.O):
+				s, _ := font.pass_variables["sigmoid.sharpness"].(f64)
+				s += 0.25
+				font.pass_variables["sigmoid.sharpness"] = s
+				font_changed = true
+
+
 		case rl.IsKeyPressed(.J): font.edge_value -= 0.05; font_changed = true
 		case rl.IsKeyPressed(.K): font.edge_value += 0.05; font_changed = true
 		case rl.IsKeyPressed(.N): font.dist_scale -= 0.05; font_changed = true
 		case rl.IsKeyPressed(.M): font.dist_scale += 0.05; font_changed = true
 		}
-
 
 		if font_changed {
 			font_refresh_sdf_store(&font)
@@ -581,6 +637,7 @@ int main(){
 			fmt.println("--------------")
 			fmt.println("Edge Value:", font.edge_value)
 			fmt.println("Dist Scale:", font.dist_scale)
+			fmt.println("Sharpness:", font.pass_variables["sigmoid.sharpness"])
 			fmt.println("--------------")
 		}
 
