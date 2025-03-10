@@ -15,11 +15,11 @@ FONT_RENDER_SCRATCH_SPACE :: #config(FONT_RENDER_SCRATCH_SPACE, 1 * mem.Megabyte
 
 FONT_RENDER_DEFAULT_CACHE_CAPACITY :: #config(FONT_RENDER_DEFAULT_CACHE_CAPACITY, 256)
 
-Byte_Block :: simd.u8x32
 
 bytes_make :: proc(width, height: int, allocator := context.allocator) -> (data: []u8, err: mem.Allocator_Error) {
-	n := width * height
-	data, err = mem.make_aligned([]u8, n, align_of(Byte_Block), allocator)
+	alignment :: align_of(simd.u16x32)
+	n := mem.align_forward_int(width * height, alignment)
+	data, err = mem.make_aligned([]u8, n, alignment, allocator)
 	return
 }
 
@@ -190,15 +190,16 @@ sigmoid :: proc(field: Distance_Field, vars: map[string]Pass_Value) -> Distance_
 	return field
 }
 
-threshold_low :: proc(field: Distance_Field, vars: map[string]Pass_Value) -> Distance_Field {
-	value: u8
+import rt "base:runtime"
 
+threshold_low :: proc(field: Distance_Field, vars: map[string]Pass_Value) -> Distance_Field {
+	threshold : u8
 	if value_var, ok := vars["threshold_low.value"].(u8); ok {
-		value = value_var
+		threshold = value_var
 	}
 
 	#no_bounds_check for v, i in field.values {
-		if v < value {
+		if v < threshold {
 			field.values[i] = 0
 		}
 	}
@@ -536,6 +537,11 @@ as_texture :: proc(atlas: Glyph_Atlas) -> rl.Texture {
 }
 
 font_refresh_sdf_store :: proc(font: ^Font) -> (err: mem.Allocator_Error){
+	when ODIN_DEBUG {
+		start := time.now()
+		defer fmt.printfln("Refresh %v fields: %v", len(font.sdf_store), time.since(start))
+	}
+
 	context.allocator = font.allocator
 	for codepoint, field in font.sdf_store {
 		delete(field.values)
@@ -564,7 +570,7 @@ main :: proc(){
 	font.dist_scale = 0.60
 	font.pass_variables["sigmoid.sharpness"] = 8.3
 	font.pass_variables["threshold_low.value"] = u8(0x30)
-	font.raster_passes = {sigmoid, threshold_low}
+	font.raster_passes = {sigmoid}
 
 	ensure(ok, "Failed to load font")
 
@@ -595,9 +601,9 @@ int main(){
 	// rects := render_text(&font, "AAA AAA")
 
 	fmt.println(box)
-	show_boxes := true
+	show_boxes := false
 
-	font_changed := false
+	font_change := 0
 
 	for !rl.WindowShouldClose(){
 		rl.BeginDrawing()
@@ -612,33 +618,35 @@ int main(){
 				s, _ := font.pass_variables["sigmoid.sharpness"].(f64)
 				s -= 0.25
 				font.pass_variables["sigmoid.sharpness"] = s
-				font_changed = true
+				font_change = 1
 			case rl.IsKeyPressed(.O):
 				s, _ := font.pass_variables["sigmoid.sharpness"].(f64)
 				s += 0.25
 				font.pass_variables["sigmoid.sharpness"] = s
-				font_changed = true
+				font_change = 1
 
 
-		case rl.IsKeyPressed(.J): font.edge_value -= 0.05; font_changed = true
-		case rl.IsKeyPressed(.K): font.edge_value += 0.05; font_changed = true
-		case rl.IsKeyPressed(.N): font.dist_scale -= 0.05; font_changed = true
-		case rl.IsKeyPressed(.M): font.dist_scale += 0.05; font_changed = true
+		case rl.IsKeyPressed(.J): font.edge_value -= 0.05; font_change = 2
+		case rl.IsKeyPressed(.K): font.edge_value += 0.05; font_change = 2
+		case rl.IsKeyPressed(.N): font.dist_scale -= 0.05; font_change = 2
+		case rl.IsKeyPressed(.M): font.dist_scale += 0.05; font_change = 2
 		}
 
-		if font_changed {
-			font_refresh_sdf_store(&font)
+		if font_change > 0 {
+			if font_change > 1 {
+				font_refresh_sdf_store(&font)
+			}
 			font_update_atlas(&font)
 
 			rl.UnloadTexture(tex)
 			tex = as_texture(font.atlas)
-			font_changed = false
 
 			fmt.println("--------------")
 			fmt.println("Edge Value:", font.edge_value)
 			fmt.println("Dist Scale:", font.dist_scale)
 			fmt.println("Sharpness:", font.pass_variables["sigmoid.sharpness"])
 			fmt.println("--------------")
+			font_change = 0
 		}
 
 		mouse_pos := rl.GetMousePosition()
